@@ -7,7 +7,9 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/muesli/termenv"
 )
 
 func fixtureDiff(t *testing.T) *FileDiff {
@@ -27,6 +29,16 @@ func renderModel(t *testing.T) Model {
 	m := NewModel(&Repository{Root: "/demo/project"}, Options{NoDelta: true})
 	updated, _ := m.Update(refreshMsg{Snapshot: Snapshot{Files: []*FileDiff{f}, StagedFiles: 3}})
 	return updated.(Model)
+}
+
+// forceColor switches lipgloss to truecolor for assertions on escape
+// sequences; under the test runner's default Ascii profile styles render
+// empty. Restored on cleanup so style-free tests stay style-free.
+func forceColor(t *testing.T) {
+	t.Helper()
+	old := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	t.Cleanup(func() { lipgloss.SetColorProfile(old) })
 }
 
 func TestLayoutsStayInsideTerminalAndMapEverySourceLine(t *testing.T) {
@@ -124,6 +136,99 @@ func TestTreeCanShowDeletedFileAndReplacementDirectory(t *testing.T) {
 	rows := treeRows([]*FileDiff{{Path: "a", Deleted: true}, {Path: "a/new.txt", Untracked: true}}, nil, "")
 	if len(rows) != 3 || !rows[0].Dir || rows[0].Key() == rows[2].Key() || rows[2].Dir {
 		t.Fatalf("file/directory collision: %+v", rows)
+	}
+}
+
+func TestChangedLinesCarryFullWidthBackground(t *testing.T) {
+	forceColor(t)
+	// Unified: every changed line owns a whole row.
+	m := renderModel(t)
+	m.resize(100, 30)
+	f := m.activeFile()
+	rows := m.buildDiffRows()
+	rowFor := func(ref LineRef) (DiffRow, bool) {
+		for _, r := range rows {
+			if r.Contains(ref) {
+				return r, true
+			}
+		}
+		return DiffRow{}, false
+	}
+	checkTint := func(where string, kind byte, text string) {
+		t.Helper()
+		hasAdded := strings.Contains(text, addedBgSeq)
+		hasRemoved := strings.Contains(text, removedBgSeq)
+		switch kind {
+		case '+':
+			if !hasAdded || hasRemoved {
+				t.Fatalf("%s: added line tint wrong: %q", where, text)
+			}
+		case '-':
+			if !hasRemoved || hasAdded {
+				t.Fatalf("%s: removed line tint wrong: %q", where, text)
+			}
+		default:
+			if hasAdded || hasRemoved {
+				t.Fatalf("%s: context line unexpectedly tinted: %q", where, text)
+			}
+		}
+	}
+	for hi, h := range f.Hunks {
+		for li := range h.Lines {
+			row, found := rowFor(LineRef{hi, li})
+			if !found {
+				t.Fatalf("unified: no row for %v", LineRef{hi, li})
+			}
+			checkTint("unified", h.Lines[li].Kind, row.Text)
+		}
+	}
+	// Split: a '-' and its paired '+' share one row, so the tint belongs to
+	// the cell, not the row. Assert per cell on the line's natural side.
+	m.SideBySide = true
+	m.resize(100, 30)
+	numbered := numberLines(m.activeFile())
+	for hi, h := range m.activeFile().Hunks {
+		for li := range h.Lines {
+			n := numbered[hi][li]
+			cell := m.sideCell(&n, h.Lines[li].Kind != '-', 40, 4)
+			checkTint("split", h.Lines[li].Kind, cell)
+		}
+	}
+}
+
+func TestChangeTintCoversPaddingAndSelectionWins(t *testing.T) {
+	forceColor(t)
+	m := renderModel(t)
+	m.resize(100, 30)
+	ref := LineRef{Hunk: 0, Line: 3} // '+func main() {'
+	rows := m.buildDiffRows()
+	for _, row := range rows {
+		if !row.Contains(ref) {
+			continue
+		}
+		// The tint is applied after padding, so it must reach the right edge:
+		// background sequence first, padded plain text, single trailing reset.
+		if !strings.HasPrefix(row.Text, addedBgSeq) {
+			t.Fatalf("tint does not start the row: %q", row.Text)
+		}
+		if strings.HasSuffix(row.Text, addedBgSeq) {
+			t.Fatalf("padding left untinted outside the styled span: %q", row.Text)
+		}
+		if trailing := row.Text[len(row.Text)-len("\x1b[0m"):]; trailing != "\x1b[0m" {
+			t.Fatalf("row does not close its styles: %q", row.Text)
+		}
+	}
+	// Visual selection replaces the change tint.
+	m.Visual = true
+	m.Unit = 0
+	m.Line = 3
+	for _, row := range m.buildDiffRows() {
+		if !row.Contains(ref) {
+			continue
+		}
+		if strings.Contains(row.Text, addedBgSeq) || !strings.Contains(row.Text, bgSequence(colorVisual)) {
+			t.Fatalf("selection did not replace change tint: %q", row.Text)
+		}
 	}
 }
 

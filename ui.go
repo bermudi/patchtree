@@ -15,30 +15,54 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/muesli/termenv"
 )
 
 const (
-	colorText    = "#D6DBE9"
-	colorMuted   = "#79849C"
-	colorAccent  = "#71DAC6"
-	colorAdded   = "#9BE5AC"
-	colorRemoved = "#F39B9B"
-	colorPurple  = "#B5A0F5"
-	colorPanel   = "#253247"
-	colorVisual  = "#30304E"
+	colorText      = "#D6DBE9"
+	colorMuted     = "#79849C"
+	colorAccent    = "#71DAC6"
+	colorAdded     = "#9BE5AC"
+	colorRemoved   = "#F39B9B"
+	colorPurple    = "#B5A0F5"
+	colorPanel     = "#253247"
+	colorVisual    = "#30304E"
+	colorAddedBg   = "#1d3d28"
+	colorRemovedBg = "#46242c"
 )
 
 var (
-	textStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
-	mutedStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
-	accentStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorAccent)).Bold(true)
-	addedStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorAdded))
-	removedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorRemoved))
-	purpleStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorPurple))
+	textStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
+	mutedStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
+	accentStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorAccent)).Bold(true)
+	addedStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(colorAdded))
+	removedStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorRemoved))
+	addedBgStyle   = lipgloss.NewStyle().Background(lipgloss.Color(colorAddedBg))
+	removedBgStyle = lipgloss.NewStyle().Background(lipgloss.Color(colorRemovedBg))
+	purpleStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorPurple))
 )
 
-// Display untrusted repository text without passing its terminal controls on to
-// the user's terminal. Patch generation always uses the untouched original.
+// bgSequence builds the SGR truecolor background escape for a hex color.
+// Deliberately not derived from a lipgloss style: styles render empty under
+// the Ascii color profile (tests, pipes), while the TUI needs a constant
+// sequence to repair delta output with.
+func bgSequence(hex string) string {
+	return "\x1b[" + termenv.RGBColor(hex).Sequence(true) + "m"
+}
+
+var (
+	addedBgSeq   = bgSequence(colorAddedBg)
+	removedBgSeq = bgSequence(colorRemovedBg)
+)
+
+// reestablishBackground re-emits a background sequence after every ANSI
+// reset. Delta restarts styles with hard resets around intraline emphasis
+// spans, and lipgloss does not re-apply a wrapping style across inner
+// resets — without this the row tint would die at the first changed token.
+func reestablishBackground(s, seq string) string {
+	return strings.ReplaceAll(s, "\x1b[0m", "\x1b[0m"+seq)
+}
+
 func safeText(s string) string {
 	var b strings.Builder
 	for _, r := range s {
@@ -369,7 +393,14 @@ func highlightWithDelta(ctx context.Context, delta, root string, f *FileDiff) (H
 			return result, fmt.Errorf("delta changed source text; using the built-in diff renderer")
 		}
 		if ref, ok := refs[i]; ok {
-			result.Lines[ref] = ansi.Cut(output[i], 1, ansi.StringWidth(output[i]))
+			code := ansi.Cut(output[i], 1, ansi.StringWidth(output[i]))
+			switch f.Hunks[ref.Hunk].Lines[ref.Line].Kind {
+			case '+':
+				code = reestablishBackground(code, addedBgSeq)
+			case '-':
+				code = reestablishBackground(code, removedBgSeq)
+			}
+			result.Lines[ref] = code
 		}
 	}
 	return result, nil
@@ -485,9 +516,9 @@ func lineNumber(n, width int) string {
 func changeSign(kind byte) string {
 	switch kind {
 	case '+':
-		return addedStyle.Render("+")
+		return addedStyle.Bold(true).Render("+")
 	case '-':
-		return removedStyle.Render("−")
+		return removedStyle.Bold(true).Render("−")
 	default:
 		return " "
 	}
@@ -497,11 +528,17 @@ func (m Model) unifiedRow(n numberedLine, ui, width, digits int) DiffRow {
 	gutter := m.lineMarker(n.ref, n.line.Kind) + mutedStyle.Render(lineNumber(n.old, digits)+" "+lineNumber(n.newer, digits)+" ") +
 		changeSign(n.line.Kind) + mutedStyle.Render(" │ ")
 	text := gutter + crop(m.code(n), m.Horizontal, width-ansi.StringWidth(gutter))
-	if m.inVisual(n.ref) || m.Marks[n.ref] {
-		text = lipgloss.NewStyle().Background(lipgloss.Color(colorVisual)).Render(text)
+	rowText := fit(text, width)
+	switch {
+	case m.inVisual(n.ref) || m.Marks[n.ref]:
+		rowText = lipgloss.NewStyle().Background(lipgloss.Color(colorVisual)).Render(rowText)
+	case n.line.Kind == '+':
+		rowText = addedBgStyle.Render(rowText)
+	case n.line.Kind == '-':
+		rowText = removedBgStyle.Render(rowText)
 	}
 	ref := n.ref
-	row := DiffRow{Text: fit(text, width), Unit: ui}
+	row := DiffRow{Text: rowText, Unit: ui}
 	if n.line.Kind != '+' {
 		row.Left = &ref
 	}
@@ -521,10 +558,16 @@ func (m Model) sideCell(n *numberedLine, right bool, width, digits int) string {
 	}
 	gutter := m.lineMarker(n.ref, n.line.Kind) + mutedStyle.Render(lineNumber(num, digits)+" ") + changeSign(n.line.Kind) + " "
 	text := gutter + crop(m.code(*n), m.Horizontal, width-ansi.StringWidth(gutter))
-	if m.inVisual(n.ref) || m.Marks[n.ref] {
-		text = lipgloss.NewStyle().Background(lipgloss.Color(colorVisual)).Render(text)
+	rowText := fit(text, width)
+	switch {
+	case m.inVisual(n.ref) || m.Marks[n.ref]:
+		rowText = lipgloss.NewStyle().Background(lipgloss.Color(colorVisual)).Render(rowText)
+	case n.line.Kind == '+':
+		rowText = addedBgStyle.Render(rowText)
+	case n.line.Kind == '-':
+		rowText = removedBgStyle.Render(rowText)
 	}
-	return fit(text, width)
+	return rowText
 }
 
 func (m Model) sideRow(left, right *numberedLine, ui, width, digits int) DiffRow {
