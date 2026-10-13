@@ -15,8 +15,10 @@ Requirements:
 - **Go 1.24 or newer** (dependencies are pinned in `go.mod` / `go.sum`).
 - **Git** on `PATH` and an interactive terminal.
 - **[delta / git-delta](https://github.com/dandavison/delta)** on `PATH` for syntax and intraline highlighting. A recent release is recommended; integration was tested with delta **0.20.1**. If delta is missing or fails, the app continues with basic addition/deletion colors.
-- Added and removed lines carry a full-width background tint (green / red) across gutter and code, so changes stand out at a glance in either layout. The tint survives delta's intraline emphasis resets and composes with both renderers.
 - A terminal at least **64 columns × 12 rows**. Approximately 120 columns is comfortable for side-by-side mode. The palette is designed for a dark terminal.
+
+Added and removed lines carry a full-width green/red background across gutter,
+code and padding in either layout. Selection replaces the change tint.
 
 Install delta with your package manager, or for example:
 

@@ -38,7 +38,7 @@ func TestDeltaInvocationNeverProbesTTYOrUsesPager(t *testing.T) {
 	}
 }
 
-func TestTintSurvivesDeltaIntralineResets(t *testing.T) {
+func TestDeltaCacheRemainsBackgroundFree(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX fake executable")
 	}
@@ -59,21 +59,14 @@ func TestTintSurvivesDeltaIntralineResets(t *testing.T) {
 	// is line 4). '+func main() {' (14 runes) splits as '+func m' + 'ain() {',
 	// marker then cut by the mapping protocol.
 	added := h.Lines[LineRef{0, 3}]
-	want := "\x1b[38;2;1;2;3mfunc m\x1b[0m" + addedBgSeq + "ain() {\x1b[0m" + addedBgSeq
+	want := "\x1b[38;2;1;2;3mfunc m\x1b[0main() {\x1b[0m"
 	if added != want {
-		t.Fatalf("added line tint broken:\n got %q\nwant %q", added, want)
+		t.Fatalf("delta foreground styles changed:\n got %q\nwant %q", added, want)
 	}
-	if other := h.Lines[LineRef{0, 4}]; !strings.Contains(other, addedBgSeq) {
-		t.Fatalf("second added line untinted: %q", other)
-	}
-	removed := h.Lines[LineRef{0, 2}]
-	if !strings.Contains(removed, removedBgSeq) || strings.Contains(removed, addedBgSeq) {
-		t.Fatalf("removed line tint wrong: %q", removed)
-	}
-	for _, li := range []int{0, 1, 5, 6} {
+	for _, li := range []int{0, 1, 2, 3, 4, 5, 6} {
 		ctx := h.Lines[LineRef{0, li}]
 		if strings.Contains(ctx, addedBgSeq) || strings.Contains(ctx, removedBgSeq) {
-			t.Fatalf("context line %d unexpectedly tinted: %q", li, ctx)
+			t.Fatalf("cached line %d unexpectedly tinted: %q", li, ctx)
 		}
 	}
 }

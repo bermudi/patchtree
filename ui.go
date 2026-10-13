@@ -15,7 +15,6 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
-	"github.com/muesli/termenv"
 )
 
 const (
@@ -42,27 +41,25 @@ var (
 	purpleStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorPurple))
 )
 
-// bgSequence builds the SGR truecolor background escape for a hex color.
-// Deliberately not derived from a lipgloss style: styles render empty under
-// the Ascii color profile (tests, pipes), while the TUI needs a constant
-// sequence to repair delta output with.
-func bgSequence(hex string) string {
-	return "\x1b[" + termenv.RGBColor(hex).Sequence(true) + "m"
+// renderRowBackground restores the chosen background after resets anywhere
+// in the completed row: gutter, syntax spans, clipping marker and padding.
+// Keep cached delta output background-free so selection can replace the tint.
+func renderRowBackground(text string, style lipgloss.Style) string {
+	// Derive the opening SGR from the active color profile, not a hard-coded
+	// truecolor sequence. Ascii renders just the space, giving an empty prefix.
+	prefix := strings.TrimSuffix(strings.TrimSuffix(style.Render(" "), "\x1b[0m"), " ")
+	if prefix != "" {
+		text = strings.NewReplacer(
+			"\x1b[0m", "\x1b[0m"+prefix,
+			"\x1b[m", "\x1b[m"+prefix,
+			"\x1b[49m", "\x1b[49m"+prefix,
+		).Replace(text)
+	}
+	return style.Render(text)
 }
 
-var (
-	addedBgSeq   = bgSequence(colorAddedBg)
-	removedBgSeq = bgSequence(colorRemovedBg)
-)
-
-// reestablishBackground re-emits a background sequence after every ANSI
-// reset. Delta restarts styles with hard resets around intraline emphasis
-// spans, and lipgloss does not re-apply a wrapping style across inner
-// resets — without this the row tint would die at the first changed token.
-func reestablishBackground(s, seq string) string {
-	return strings.ReplaceAll(s, "\x1b[0m", "\x1b[0m"+seq)
-}
-
+// Display repository text without passing its terminal controls through.
+// Patch generation always uses the untouched original.
 func safeText(s string) string {
 	var b strings.Builder
 	for _, r := range s {
@@ -393,14 +390,7 @@ func highlightWithDelta(ctx context.Context, delta, root string, f *FileDiff) (H
 			return result, fmt.Errorf("delta changed source text; using the built-in diff renderer")
 		}
 		if ref, ok := refs[i]; ok {
-			code := ansi.Cut(output[i], 1, ansi.StringWidth(output[i]))
-			switch f.Hunks[ref.Hunk].Lines[ref.Line].Kind {
-			case '+':
-				code = reestablishBackground(code, addedBgSeq)
-			case '-':
-				code = reestablishBackground(code, removedBgSeq)
-			}
-			result.Lines[ref] = code
+			result.Lines[ref] = ansi.Cut(output[i], 1, ansi.StringWidth(output[i]))
 		}
 	}
 	return result, nil
@@ -531,11 +521,11 @@ func (m Model) unifiedRow(n numberedLine, ui, width, digits int) DiffRow {
 	rowText := fit(text, width)
 	switch {
 	case m.inVisual(n.ref) || m.Marks[n.ref]:
-		rowText = lipgloss.NewStyle().Background(lipgloss.Color(colorVisual)).Render(rowText)
+		rowText = renderRowBackground(rowText, lipgloss.NewStyle().Background(lipgloss.Color(colorVisual)))
 	case n.line.Kind == '+':
-		rowText = addedBgStyle.Render(rowText)
+		rowText = renderRowBackground(rowText, addedBgStyle)
 	case n.line.Kind == '-':
-		rowText = removedBgStyle.Render(rowText)
+		rowText = renderRowBackground(rowText, removedBgStyle)
 	}
 	ref := n.ref
 	row := DiffRow{Text: rowText, Unit: ui}
@@ -561,11 +551,11 @@ func (m Model) sideCell(n *numberedLine, right bool, width, digits int) string {
 	rowText := fit(text, width)
 	switch {
 	case m.inVisual(n.ref) || m.Marks[n.ref]:
-		rowText = lipgloss.NewStyle().Background(lipgloss.Color(colorVisual)).Render(rowText)
+		rowText = renderRowBackground(rowText, lipgloss.NewStyle().Background(lipgloss.Color(colorVisual)))
 	case n.line.Kind == '+':
-		rowText = addedBgStyle.Render(rowText)
+		rowText = renderRowBackground(rowText, addedBgStyle)
 	case n.line.Kind == '-':
-		rowText = removedBgStyle.Render(rowText)
+		rowText = renderRowBackground(rowText, removedBgStyle)
 	}
 	return rowText
 }
