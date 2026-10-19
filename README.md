@@ -2,7 +2,7 @@
 
 **File-tree navigation. Hunk- and line-sized staging.**
 
-A Go / Bubble Tea TUI for reviewing unstaged changes and putting only the changes you choose into Git's index. It combines a collapsible, diffnav-style tree with `git add --patch`-style actions. It does **not** commit, reset, discard worktree changes, or manage branches/remotes.
+A Go / Bubble Tea TUI for reviewing unstaged changes and putting only the changes you choose into Git's index. It combines a collapsible, diffnav-style tree with `git add --patch`-style staging and `git restore`-style reverting. It does **not** commit, reset, or manage branches/remotes; unstaged changes leave the worktree only when you explicitly revert them with `R`/`X` and confirm.
 
 ![Patchtree running in a terminal: file tree, delta syntax highlighting, split hunks, and marked lines](docs/preview.png)
 
@@ -61,10 +61,11 @@ make build                          # Optional convenience targets below.
 3. Use `y` to stage the active hunk; `n` skips it without changing Git.
 4. Use `s` in the **diff** to split a hunk at context gaps. Use `S` to change the diff layout.
 5. For lines: `V` starts a range, `J` / `K` extends it, and `Space` marks/unmarks changed lines. `y` or `Enter` applies the marks.
-6. The tree, diff, staged-file count, and active hunk refresh **without exiting**. A fully staged file disappears from the unstaged tree.
-7. `q` exits, leaving already-staged changes in place. Inspect them with `git diff --cached` afterward.
+6. To drop a change instead, press `R` in the diff to revert this hunk (or the marked lines) and confirm with `y`. `X` reverts the whole file. The worktree is restored to the index; already-staged work is never touched.
+7. The tree, diff, staged-file count, and active hunk refresh **without exiting**. A fully staged or fully reverted file disappears from the unstaged tree.
+8. `q` exits, leaving already-staged changes in place. Inspect them with `git diff --cached` afterward.
 
-> **Marks are a review queue, not immediate index changes.** `Space` never applies a patch. When any lines are marked, `y` stages **all marked changed lines in the current file**, instead of the whole active hunk. This batching lets you select both sides of a replacement before applying it.
+> **Marks are a review queue, not immediate index changes.** `Space` never applies a patch. When any lines are marked, `y` stages **all marked changed lines in the current file** and `R` reverts them instead, after a confirmation. This batching lets you select both sides of a replacement before applying or reverting it.
 
 ## Keybindings
 
@@ -87,6 +88,7 @@ The focused pane's title is accented. `Tab` changes focus; `?` opens the complet
 | `S` | Toggle unified / side-by-side diff layout |
 | `r` | Refresh changes and the actual staged-file count |
 | `f` | Stage the whole selected **file**, including modes, via `git add -A` |
+| `X` | Revert (discard) every unstaged change in the selected file, after a confirmation |
 | `?` | Toggle help; `j` / `k` scroll help on a small terminal |
 | `q`, `Ctrl-c` | Quit without staging anything else |
 
@@ -120,9 +122,11 @@ Each text file has addition/deletion stats; directories aggregate their children
 | `n` | Mark this hunk skipped and advance; at the last hunk, advance to the next file |
 | `s` | Split this hunk into separate change groups when there is a context gap |
 | `e` | Edit the current hunk/marked patch in an external editor, then apply the saved patch |
+| `R` | Revert this hunk, or all marked lines, restoring the worktree to the index after a confirmation |
 | `a` | Stage this hunk and every subsequent hunk in the file; earlier hunks remain unstaged |
 | `d` | Skip this hunk and all subsequent hunks; advance to the next file |
 | `f` | Stage the whole file, including any mode change |
+| `X` | Revert the whole file's unstaged changes, after a confirmation |
 
 Skipped hunks stay visible, with a `skipped` label. You can return to one and stage it later. Skipping is navigation/session state: it never discards, reverts, or stages a change. Splits and skips are remembered for unchanged files when navigating away and back; a changed diff is reparsed.
 
@@ -144,6 +148,21 @@ Side-by-side mode falls back to unified on a narrow terminal while retaining the
 Ranges and partial replacements follow **raw patch order**: retaining an unselected deletion turns it into context, while selected additions keep their relative patch order. Partial line selections can therefore create an intermediate file that is not valid source code; inspect `git diff --cached`, or use `e` if you need a custom arrangement.
 
 Switching to another file clears unapplied marks, with a notice. A watch refresh preserves them when the diff is unchanged; if the file/index changed, stale marks are cleared and you are asked to review the new preview. `a` stages entire current/remaining hunks, regardless of line marks.
+
+### Diff focus: reverting unstaged changes
+
+Reverting is the mirror of staging: it restores selected changed lines in the **worktree** to their index content. The index is never modified, so already-staged work and every unselected hunk are unaffected.
+
+| Key | Action |
+| --- | --- |
+| `R` | Revert the active hunk, or exactly the marked lines when any are marked |
+| `X` | Revert every unstaged change in the file (any focus) |
+
+Every revert shows a confirmation in the status line, e.g. `Revert hunk 2/3 of src/main.go? The worktree change will be lost.` — `y`/`Enter` confirms, and **any other key cancels**. Nothing touches disk before that.
+
+Line-level reverts follow the same **raw patch order** as staging: an unselected addition stays in the worktree and an unselected deletion stays deleted, so a partial revert can produce the mirror intermediate state. The remaining changes stay unstaged and stageable. `X` also handles what `R` cannot: binaries, symbolic links, submodules, mode-only changes, and files deleted in the worktree are restored from the index via `git restore --worktree` (content and mode). Untracked and intent-to-add files are refused — the index stores no content for them, and Patchtree never deletes files.
+
+A revert preview is fingerprinted like a staging preview: if the file or index changed since the diff was read, the revert is refused and you review the refreshed diff. EOF/no-newline protections apply to reverts exactly as they do to staging.
 
 ## External editor
 
@@ -172,7 +191,7 @@ Edited patches must pass Git's cached-index check before anything is applied. Ma
 | File | Responsibility |
 | --- | --- |
 | `main.go` | CLI, Bubble Tea `Model`, focus-aware `Update`, asynchronous Git/delta messages, watch timer, editor handoff |
-| `git.go` | Repository discovery, read-only snapshots, diff/hunk parsing, selected-line projection, editor validation, cached-index application |
+| `git.go` | Repository discovery, read-only snapshots, diff/hunk parsing, selected-line stage/revert projections, editor validation, cached-index application, worktree restore |
 | `ui.go` | Hierarchical tree, hunk splitting, delta adapter, source-to-screen mapping, both diff layouts, viewport, status/help rendering |
 | `*_test.go` | Parser, real-Git integration, patch projection, model/keybindings, renderer and edge-case tests |
 
@@ -204,22 +223,34 @@ The patch is written to a private temporary file, checked with `git apply --cach
 
 Whole-file staging uses literal pathspecs and `git add -A -- <path>`. No user pathname is interpolated into a shell command.
 
+### Reverting a selection
+
+The revert builder is the mirror projection of the stage builder:
+
+1. Keeps selected deletions as restorations (`-` becomes `+`) and selected additions as removals (`+` becomes `-`).
+2. Converts unselected additions into context and drops unselected deletions (they remain absent from the worktree).
+3. Uses the **worktree side** of the diff for old-side coordinates, shifting only the projected new side by preceding reverted hunks.
+4. Applies the same EOF/no-newline rejections as staging.
+
+The patch is checked with `git apply --check --whitespace=nowarn` and applied with `git apply --whitespace=nowarn` — never `--cached` — so the worktree is restored and the index is untouched. Whole-file `X` uses `git restore --worktree -- <path>` with literal pathspecs, restoring content and mode from the index; a deleted worktree file is recreated. Both paths re-read the snapshot and reject a changed fingerprint before touching anything, and neither ever deletes files.
+
 ### Refresh and status
 
-All Git reads/staging and delta highlighting are asynchronous commands returning typed Bubble Tea messages. Epochs prevent an older watch read from resurrecting already-staged changes. Polling reads do not overlap, and mutations temporarily disable further staging keys. Resizes, help, errors, and normal refreshes stay in the same TUI.
+All Git reads/staging and delta highlighting are asynchronous commands returning typed Bubble Tea messages. Epochs prevent an older watch read from resurrecting already-staged changes. Polling reads do not overlap, and mutations temporarily disable further staging and reverting keys. Resizes, help, errors, and normal refreshes stay in the same TUI.
 
 The staged counter is the number of distinct file paths in **`git diff --cached` relative to HEAD**. It includes changes staged before launching the app, not just this session's actions. A file remains counted after it disappears from the unstaged tree. Watch mode also detects index changes made by other tools.
 
 ## Scope and limitations
 
-- Binary files, symbolic links, empty files, mode-only changes, file-type changes, and submodule pointers require **whole-file `f` staging**. They are not treated as editable text hunks.
+- Binary files, symbolic links, empty files, mode-only changes, file-type changes, and submodule pointers require **whole-file `f` staging**; `X` reverts them whole from the index. They are not treated as editable text hunks.
 - `f` on a submodule/embedded repository stages its recorded commit only, **not files inside it**. Dirty-only submodule contents can remain listed; work in that repository to stage those contents. An embedded repository with no commit must be handled there first.
 - Unmerged paths are shown but protected: resolve conflicts outside this tool.
 - Renames are intentionally shown as separate deletion/addition entries, not inferred rename patches.
 - Ignored untracked files are excluded. A deleted untracked file has no index entry to stage; it is outside the tool's scope.
-- Collapse/skip/split state is session-local, not persisted to disk. There is no commit interface or unstage command.
+- Untracked and intent-to-add files cannot be reverted — the index stores no content for them — and Patchtree never deletes them. Remove them outside the tool.
+- Collapse/skip/split state is session-local, not persisted to disk. There is no commit interface and no unstage command; `R`/`X` restore worktree content from the index but never unstage.
 - Large repositories with many untracked files may benefit from `.gitignore` and a longer `--watch-interval`; each poll rereads the raw diff and previews untracked files.
-- Quitting does not undo already-staged changes. During an active index write, wait for it to finish before pressing `q` again.
+- Quitting does not undo already-staged changes, and a confirmed revert is final: the discarded worktree content was never in Git. During an active staging or revert write, wait for it to finish before pressing `q` again.
 
 ## Flags
 
@@ -248,8 +279,8 @@ go test -fuzz=FuzzParseDiff -fuzztime=10s
 make check
 ```
 
-Repository-backed tests create isolated temporary repositories; they never reset or modify your repository. Coverage includes full/partial replacements, multi-hunk coordinate shifts, new/deleted/empty files, intent-to-add, pre-existing staged content, shared split context, mode preservation, EOF/CRLF, Unicode/quoted/control-character filenames, binary/link/conflict protection, stale previews, editor validation, watch-state preservation, focus conflicts, layout bounds, and **100 deterministic random line-selection masks** checked against the real index.
+Repository-backed tests create isolated temporary repositories; they never reset or modify your repository. Coverage includes full/partial replacements, multi-hunk coordinate shifts, new/deleted/empty files, intent-to-add, pre-existing staged content, shared split context, mode preservation, EOF/CRLF, Unicode/quoted/control-character filenames, binary/link/conflict protection, stale previews, editor validation, watch-state preservation, focus conflicts, layout bounds, **hunk/line reverting including the confirmation flow**, and **two sets of 100 deterministic random line-selection masks** — one checked against the real index, one against the real worktree.
 
-The real delta integration test runs when `delta` is on `PATH`; otherwise that test is explicitly skipped. Backend-argument and fallback tests do not require delta. The app has also been exercised in an actual pseudo-terminal through search, split, visual marks, both layouts, partial staging, watch refresh, continued staging, **external-editor handoff and manual patch application**, and quit.
+The real delta integration test runs when `delta` is on `PATH`; otherwise that test is explicitly skipped. Backend-argument and fallback tests do not require delta. The app has also been exercised in an actual pseudo-terminal through search, split, visual marks, both layouts, partial staging, hunk and whole-file reverting (including cancellation), watch refresh, continued staging, **external-editor handoff and manual patch application**, and quit.
 
 Verified on Linux with Go **1.25.1**, Git **2.47.3**, and delta **0.20.1**: build, full test suite, race detector, `go vet`, and a ten-second parser fuzz run (over 320,000 inputs).

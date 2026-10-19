@@ -692,7 +692,11 @@ func (m Model) emptyDiff() []string {
 	result := []string{"", purpleStyle.Render("  " + safeText(f.PartialReason)), "",
 		mutedStyle.Render("  Text hunk selection is unavailable for this change.")}
 	if !f.Conflict {
-		result = append(result, mutedStyle.Render("  f stages the entire file; the worktree is untouched."))
+		whole := "  f stages the entire file; the worktree is untouched."
+		if !f.Untracked && !f.New {
+			whole = "  f stages the entire file; X reverts it to the index."
+		}
+		result = append(result, mutedStyle.Render(whole))
 	}
 	for _, line := range f.Header {
 		result = append(result, "  "+safeText(line))
@@ -809,7 +813,7 @@ func (m Model) modeLabel() string {
 func (m Model) helpView() string {
 	lines := []string{
 		"PATCHTREE / KEYBINDINGS", "",
-		"Navigation                     Staging (diff focus)",
+		"Navigation                     Stage / revert (diff focus)",
 		"  Tab       change focus          y       stage hunk / marked lines",
 		"  j/k ↑/↓   tree or diff lines     n       skip hunk, advance",
 		"  Enter     open file / marks     p [ ]   previous / next hunk",
@@ -820,12 +824,15 @@ func (m Model) helpView() string {
 		"  Esc       cancel search/visual  f       stage WHOLE file + mode",
 		"  s (tree)  toggle diff layout",
 		"  S (any)   toggle diff layout   Line selection (diff focus)",
+		"                                  R       revert hunk / marked lines",
+		"                                  X       revert WHOLE file (tracked)",
 		"  Ctrl-d/u  half-page scroll       V       enter/leave visual range",
 		"  h/l       pan diff sideways      J/K     extend range down/up",
 		"  ←/→       old/new side (split)    Space   mark/unmark changed lines",
 		"  r         refresh               y/Enter apply marked lines",
 		"  q Ctrl-c  quit                  u       clear all line marks", "",
 		"Space only queues marks. Nothing reaches the index until y/Enter.",
+		"R/X revert the worktree to the index after a y/N confirmation.",
 		"Skipping never discards changes. q keeps already-staged changes.",
 		"Binary, links, submodules and mode-only changes use f, not y.", "",
 		"? or Esc closes help.  Keys n and s depend on the focused pane.",
@@ -927,9 +934,12 @@ func (m Model) View() string {
 	status := joinEnds(textStyle.Render(location), staged, m.Width)
 	hint := " Tab focus · Enter open · n/p files · s layout · ? help · q quit"
 	if m.Focus == focusDiff {
-		hint = " y stage · n skip · s split hunk · S layout · V select · ? help · q quit"
+		hint = " y stage · n skip · R revert · s split · S layout · V select · ? help · q quit"
 	}
-	if m.Notice != "" {
+	if m.Pending != nil {
+		hint = fit(" "+removedStyle.Render(safeText("Revert "+m.Pending.Label+"? The worktree change will be lost."))+
+			mutedStyle.Render("  y confirm · any other key cancels"), m.Width)
+	} else if m.Notice != "" {
 		style := accentStyle
 		if m.NoticeError {
 			style = removedStyle

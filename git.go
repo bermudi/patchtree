@@ -570,17 +570,9 @@ func quoteGitPath(s string) string {
 	return b.String()
 }
 
-// BuildPatch projects the worktree diff onto just the selected changed lines.
-// Unselected '-' lines become context; unselected '+' lines disappear. Taking
-// a slice of the raw patch would silently delete unselected lines and is WRONG.
-func BuildPatch(f *FileDiff, selected map[LineRef]bool) (string, error) {
-	if f == nil {
-		return "", ErrNoChanges
-	}
-	if f.PartialReason != "" || f.Binary || f.Conflict {
-		return "", fmt.Errorf("cannot partially stage: %s", f.PartialReason)
-	}
-	chosen, total := 0, 0
+// countSelection validates selected refs against the parsed diff and counts
+// changed lines. Callers enforce their own minimum (chosen == 0 means none).
+func countSelection(f *FileDiff, selected map[LineRef]bool) (chosen, total int, err error) {
 	for hi, h := range f.Hunks {
 		for li, line := range h.Lines {
 			if line.Kind == ' ' {
@@ -594,8 +586,25 @@ func BuildPatch(f *FileDiff, selected map[LineRef]bool) (string, error) {
 	}
 	for ref, on := range selected {
 		if on && (ref.Hunk < 0 || ref.Hunk >= len(f.Hunks) || ref.Line < 0 || ref.Line >= len(f.Hunks[ref.Hunk].Lines)) {
-			return "", fmt.Errorf("stale line selection; refresh the diff")
+			return 0, 0, fmt.Errorf("stale line selection; refresh the diff")
 		}
+	}
+	return chosen, total, nil
+}
+
+// BuildPatch projects the worktree diff onto just the selected changed lines.
+// Unselected '-' lines become context; unselected '+' lines disappear. Taking
+// a slice of the raw patch would silently delete unselected lines and is WRONG.
+func BuildPatch(f *FileDiff, selected map[LineRef]bool) (string, error) {
+	if f == nil {
+		return "", ErrNoChanges
+	}
+	if f.PartialReason != "" || f.Binary || f.Conflict {
+		return "", fmt.Errorf("cannot partially stage: %s", f.PartialReason)
+	}
+	chosen, total, err := countSelection(f, selected)
+	if err != nil {
+		return "", err
 	}
 	if chosen == 0 {
 		return "", ErrNoChanges
@@ -656,6 +665,122 @@ func BuildPatch(f *FileDiff, selected map[LineRef]bool) (string, error) {
 		delta += h.NewLines - h.OldLines
 	}
 	return b.String(), nil
+}
+
+// BuildRevertPatch projects the worktree diff onto a patch that RESTORES the
+// selected changed lines to the index content. It is the mirror of BuildPatch:
+// selected '+' lines are removed from the worktree, selected '-' lines are put
+// back, unselected '+' lines stay as context, and unselected '-' lines stay
+// absent. Apply the result with `git apply` to the worktree, never --cached.
+func BuildRevertPatch(f *FileDiff, selected map[LineRef]bool) (string, error) {
+	if f == nil {
+		return "", ErrNoChanges
+	}
+	switch {
+	case f.Untracked || f.New:
+		return "", fmt.Errorf("untracked or intent-to-add file has no stored content; nothing to restore")
+	case f.Deleted:
+		return "", fmt.Errorf("file is deleted in the worktree; restore the whole file instead")
+	case f.PartialReason != "" || f.Binary || f.Conflict:
+		return "", fmt.Errorf("cannot partially revert: %s", f.PartialReason)
+	}
+	chosen, _, err := countSelection(f, selected)
+	if err != nil {
+		return "", err
+	}
+	if chosen == 0 {
+		return "", ErrNoChanges
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "diff --git %s %s\n", quoteGitPath("a/"+f.Path), quoteGitPath("b/"+f.Path))
+	fmt.Fprintf(&b, "--- %s\n+++ %s\n", quoteGitPath("a/"+f.Path), quoteGitPath("b/"+f.Path))
+	delta := 0 // Only kept revert hunks shift later new-side coordinates.
+	for hi, original := range f.Hunks {
+		h := original
+		h.Lines = nil
+		hasChange := false
+		for li, line := range original.Lines {
+			if line.Kind == ' ' {
+				h.Lines = append(h.Lines, line)
+				continue
+			}
+			if !selected[LineRef{hi, li}] {
+				if line.Kind == '+' {
+					line.Kind = ' ' // An unselected addition stays in the worktree.
+					h.Lines = append(h.Lines, line)
+				}
+				continue // An unselected deletion stays absent from the worktree.
+			}
+			hasChange = true
+			if line.Kind == '-' {
+				line.Kind = '+' // Restore the index line.
+			} else {
+				line.Kind = '-' // Remove the added line.
+			}
+			h.Lines = append(h.Lines, line)
+		}
+		if !hasChange {
+			continue
+		}
+		h.OldLines, h.NewLines = countLines(h.Lines)
+		// The old side is the CURRENT worktree, so its starts use the original
+		// NewStart coordinates; only the projected new side accumulates delta.
+		base := original.NewStart
+		if original.NewLines != 0 {
+			base--
+		}
+		h.OldStart = base
+		if h.OldLines != 0 {
+			h.OldStart++
+		}
+		h.NewStart = base + delta
+		if h.NewLines != 0 {
+			h.NewStart++
+		}
+		if err := validateNoNewline(h); err != nil {
+			return "", err
+		}
+		writeHunk(&b, h)
+		delta += h.NewLines - h.OldLines
+	}
+	return b.String(), nil
+}
+
+// ApplyRevertPatch restores worktree content for the selected lines. The index
+// is never touched. Git validates the context and only replaces a file after
+// every hunk in it applies, so a failed check leaves the worktree alone.
+func (r *Repository) ApplyRevertPatch(ctx context.Context, patchText string) error {
+	if patchText == "" {
+		return ErrNoChanges
+	}
+	f, err := os.CreateTemp("", "patchtree-revert-*.patch")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	if _, err = f.WriteString(patchText); err != nil {
+		f.Close()
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	if _, err = r.git(ctx, "apply", "--check", "--whitespace=nowarn", "--", f.Name()); err != nil {
+		return fmt.Errorf("revert check failed (worktree unchanged): %w", err)
+	}
+	if _, err = r.git(ctx, "apply", "--whitespace=nowarn", "--", f.Name()); err != nil {
+		return fmt.Errorf("revert application failed: %w", err)
+	}
+	return nil
+}
+
+// RestoreFile restores one worktree path, including its mode, from the index.
+func (r *Repository) RestoreFile(ctx context.Context, name string) error {
+	if !validRepoPath(name) {
+		return fmt.Errorf("unsafe file path %q", name)
+	}
+	_, err := r.git(ctx, "restore", "--worktree", "--", name)
+	return err
 }
 
 func validateNoNewline(h Hunk) error {

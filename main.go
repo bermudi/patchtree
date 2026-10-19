@@ -17,7 +17,7 @@ import (
 	"github.com/mattn/go-shellwords"
 )
 
-var version = "0.1.0"
+var version = "0.2.0"
 
 type focus uint8
 
@@ -74,6 +74,7 @@ type Model struct {
 	Epoch         uint64 // Invalidates reads started before a staging/editor action.
 	Notice        string
 	NoticeError   bool
+	Pending       *PendingRevert
 	Help          bool
 	HelpOffset    int
 	Quitting      bool
@@ -112,6 +113,29 @@ type editedMsg struct {
 	Request      stageRequest
 	Base, Edited string
 	Err          error
+}
+
+// revertRequest restores worktree content from the index: either the patch's
+// selected lines or, with WholeFile, the entire path. The index never changes.
+type revertRequest struct {
+	Path, Expected, Patch, Label string
+	WholeFile                    bool
+	Anchor                       int
+	Epoch                        uint64
+}
+
+type revertedMsg struct {
+	Request      revertRequest
+	Snapshot     Snapshot
+	HaveSnapshot bool
+	Applied      bool
+	Err          error
+}
+
+// PendingRevert is a confirmation prompt; nothing has been modified yet.
+type PendingRevert struct {
+	Label   string
+	Request revertRequest
 }
 
 func NewModel(repo *Repository, options Options) Model {
@@ -534,6 +558,133 @@ func (m *Model) startStage(request stageRequest) tea.Cmd {
 	return runStageCmd(m.Repo, request)
 }
 
+// runRevertCmd re-reads the snapshot first: a stale preview (or a concurrent
+// edit) must never revert content the user has not seen.
+func runRevertCmd(repo *Repository, request revertRequest) tea.Cmd {
+	return func() tea.Msg {
+		msg := revertedMsg{Request: request}
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		defer cancel()
+		before, err := repo.ReadSnapshot(ctx)
+		if err != nil {
+			msg.Err = err
+			return msg
+		}
+		msg.Snapshot, msg.HaveSnapshot = before, true
+		f := before.File(request.Path)
+		if f == nil || f.Fingerprint != request.Expected {
+			msg.Err = fmt.Errorf("file or index changed since preview; nothing reverted. Review and retry")
+			return msg
+		}
+		if f.Conflict {
+			msg.Err = fmt.Errorf("resolve unmerged paths outside Patchtree")
+			return msg
+		}
+		if f.Untracked || f.New {
+			msg.Err = fmt.Errorf("untracked or intent-to-add file cannot be reverted; there is no stored content to restore")
+			return msg
+		}
+		if request.WholeFile {
+			err = repo.RestoreFile(ctx, request.Path)
+		} else {
+			err = repo.ApplyRevertPatch(ctx, request.Patch)
+		}
+		if err != nil {
+			msg.Err = err
+			return msg
+		}
+		msg.Applied = true
+		after, err := repo.ReadSnapshot(ctx)
+		if err != nil {
+			msg.HaveSnapshot = false
+			msg.Err = fmt.Errorf("reverted successfully, but refresh failed: %w", err)
+			return msg
+		}
+		msg.Snapshot = after
+		return msg
+	}
+}
+
+func (m *Model) startRevert(request revertRequest) tea.Cmd {
+	m.Epoch++
+	request.Epoch = m.Epoch
+	m.Busy, m.Reloading = "reverting", false
+	m.Visual = false
+	m.notice("", false)
+	m.rebuildDiff(false)
+	return runRevertCmd(m.Repo, request)
+}
+
+// requestRevert stages nothing: it prepares the mirror of y and asks for a
+// confirmation. Whole-file X reuses requestRevertFile.
+func (m *Model) requestRevert() {
+	f := m.activeFile()
+	if f == nil {
+		m.notice("No unstaged file selected.", false)
+		return
+	}
+	if len(m.Units) == 0 {
+		m.notice("Cannot partially revert: "+f.PartialReason+". X reverts the whole file.", true)
+		return
+	}
+	switch {
+	case f.Conflict:
+		m.notice(f.PartialReason, true)
+		return
+	case f.Untracked || f.New:
+		m.notice("Untracked or intent-to-add file has no stored content to restore; remove it outside Patchtree.", true)
+		return
+	case f.Deleted:
+		m.notice("This file is deleted in the worktree; X restores the whole file.", true)
+		return
+	case f.PartialReason != "":
+		m.notice("Cannot revert part of this change: "+f.PartialReason+". X reverts the whole file.", true)
+		return
+	}
+	selected := m.Marks
+	label := fmt.Sprintf("hunk %d/%d of %s", m.Unit+1, len(m.Units), displayPath(f.Path))
+	if len(selected) == 0 {
+		selected = unitSelection(f, m.Units[m.Unit:m.Unit+1])
+	} else if len(selected) == 1 {
+		label = "1 marked line in " + displayPath(f.Path)
+	} else {
+		label = fmt.Sprintf("%d marked lines in %s", len(selected), displayPath(f.Path))
+	}
+	patchText, err := BuildRevertPatch(f, selected)
+	if err != nil {
+		m.notice(err.Error(), true)
+		return
+	}
+	m.Pending = &PendingRevert{Label: label, Request: revertRequest{
+		Path: f.Path, Expected: f.Fingerprint, Patch: patchText, Label: label,
+		Anchor: f.Hunks[m.Units[m.Unit].Hunk].OldStart,
+	}}
+}
+
+func (m *Model) requestRevertFile() {
+	f := m.activeFile()
+	if f == nil {
+		m.notice("No unstaged file selected.", false)
+		return
+	}
+	switch {
+	case f.Conflict:
+		m.notice(f.PartialReason, true)
+		return
+	case f.Untracked || f.New:
+		m.notice("Untracked or intent-to-add file has no stored content to restore; remove it outside Patchtree.", true)
+		return
+	}
+	label := "all unstaged changes in " + displayPath(f.Path)
+	anchor := -1
+	if len(m.Units) > 0 {
+		anchor = f.Hunks[m.Units[m.Unit].Hunk].OldStart
+	}
+	m.Pending = &PendingRevert{Label: label, Request: revertRequest{
+		Path: f.Path, Expected: f.Fingerprint, WholeFile: true, Label: label, Anchor: anchor,
+	}}
+}
+
 func (m *Model) stageSelection(remaining, wholeFile bool) tea.Cmd {
 	f := m.activeFile()
 	if f == nil {
@@ -810,6 +961,8 @@ func (m *Model) updateTree(key string) tea.Cmd {
 		m.rebuildDiff(true)
 	case "y", "a", "d", "e":
 		m.notice("Enter or Tab focuses the diff pane for hunk staging.", false)
+	case "R":
+		m.notice("Tab to the diff pane to revert a hunk, or X reverts the whole file.", false)
 	}
 	return nil
 }
@@ -860,6 +1013,8 @@ func (m *Model) updateDiff(key string) tea.Cmd {
 		m.splitHunk()
 	case "e":
 		return m.editHunk()
+	case "R":
+		m.requestRevert()
 	case "ctrl+d", "pgdown":
 		m.scrollDiff(1)
 	case "ctrl+u", "pgup":
@@ -960,6 +1115,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.rebuildDiff(false)
 		return m, cmd
+	case revertedMsg:
+		if msg.Request.Epoch != m.Epoch {
+			return m, nil
+		}
+		m.Busy = ""
+		var cmd tea.Cmd
+		if msg.HaveSnapshot {
+			cmd = m.replaceSnapshot(msg.Snapshot, msg.Applied, msg.Request.Anchor)
+		}
+		if msg.Applied {
+			m.Marks = make(map[LineRef]bool)
+			m.Visual = false
+			m.notice("Reverted "+msg.Request.Label+". The index is untouched.", false)
+		}
+		if msg.Err != nil {
+			m.notice(msg.Err.Error(), true)
+			if msg.Applied && !msg.HaveSnapshot {
+				m.Reloading = true
+				cmd = tea.Batch(cmd, readSnapshotCmd(m.Repo, m.Epoch))
+			}
+		}
+		m.rebuildDiff(false)
+		return m, cmd
 	case editedMsg:
 		if msg.Request.Epoch != m.Epoch {
 			return m, nil
@@ -984,9 +1162,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	case tea.KeyMsg:
 		key := msg.String()
+		if m.Pending != nil {
+			switch key {
+			case "ctrl+c":
+				m.Quitting = true
+				return m, tea.Quit
+			case "y", "Y", "enter":
+				pending := m.Pending
+				m.Pending = nil
+				return m, m.startRevert(pending.Request)
+			default:
+				m.Pending = nil
+				m.notice("Revert canceled; nothing changed.", false)
+				return m, nil
+			}
+		}
 		if key == "ctrl+c" || (!m.Searching && key == "q") {
-			if m.Busy == "staging" {
-				m.notice("Finishing the index operation; press q again when it completes.", false)
+			if m.Busy != "" {
+				m.notice("Finishing the current operation; press q again when it completes.", false)
 				return m, nil
 			}
 			m.Quitting = true
@@ -1069,6 +1262,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			cmd := m.stageSelection(false, true)
 			return m, cmd
+		case "X":
+			if m.Focus == focusTree {
+				if row := m.Tree.Selected(); row == nil || row.Dir {
+					m.notice("Select a file, not a directory, for whole-file revert.", false)
+					return m, nil
+				}
+			}
+			m.requestRevertFile()
+			return m, nil
 		}
 		if m.Focus == focusTree {
 			cmd := m.updateTree(key)
